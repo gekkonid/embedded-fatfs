@@ -82,6 +82,10 @@ impl<T: Read + Write + Seek> StreamSlice<T> {
 
 impl<T: Read + Write + Seek> Read for StreamSlice<T> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, StreamSliceError<T::Error>> {
+        if buf.is_empty() {
+            // A zero-length write is a no-op; forwarding it would be misreported as `WriteZero` or cause other issues
+            return Ok(0);
+        }
         // Narrow only after the min, so a remaining size exactly divisible by 4GiB isn't truncated to
         // 0 by `as usize` on 32-bit targets
         let remaining = self.size - self.current_offset;
@@ -94,6 +98,10 @@ impl<T: Read + Write + Seek> Read for StreamSlice<T> {
 
 impl<T: Read + Write + Seek> Write for StreamSlice<T> {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, StreamSliceError<T::Error>> {
+        if buf.is_empty() {
+            // A zero-length write is a no-op; forwarding it would be misreported as `WriteZero` or cause other issues
+            return Ok(0);
+        }
         // Narrow only after the min, so a remaining size exactly divisible by 4GiB isn't truncated to
         // 0 by `as usize` on 32-bit targets
         let remaining = self.size - self.current_offset;
@@ -158,6 +166,24 @@ mod test {
         stream.seek(SeekFrom::Start(0)).await.unwrap();
         let data = read_to_string(&mut stream).await.unwrap();
         assert_eq!(data, "Test Rust");
+    }
+
+    #[tokio::test]
+    async fn empty_transfers_are_noops() {
+        let cur = std::io::Cursor::new("BeforeTest dataAfter".to_string().into_bytes());
+        let mut stream =
+            StreamSlice::new(embedded_io_adapters::tokio_1::FromTokio::new(cur), 6, 6 + 9)
+                .await
+                .unwrap();
+
+        // Empty write must be Ok(0), not `WriteZero`, and must not advance.
+        assert_eq!(stream.write(&[]).await.unwrap(), 0);
+        assert_eq!(stream.read(&mut []).await.unwrap(), 0);
+        assert_eq!(stream.seek(SeekFrom::Current(0)).await.unwrap(), 0);
+
+        // Data is still intact / readable afterwards.
+        let data = read_to_string(&mut stream).await.unwrap();
+        assert_eq!(data, "Test data");
     }
 
     /// A zero-storage `Read + Write + Seek` device with a virtual size, so a
