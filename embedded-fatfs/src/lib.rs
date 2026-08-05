@@ -69,6 +69,8 @@ mod boot_sector;
 mod dir;
 mod dir_entry;
 mod error;
+#[cfg(feature = "fat-cache")]
+mod fatcache;
 mod file;
 mod fs;
 mod io;

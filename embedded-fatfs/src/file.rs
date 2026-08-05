@@ -245,6 +245,8 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
 
     async fn flush(&mut self) -> Result<(), Error<IO::Error>> {
         self.flush_dir_entry().await?;
+        #[cfg(feature = "fat-cache")]
+        self.fs.flush_fat_cache().await?;
         let mut disk = self.fs.disk.borrow_mut();
         disk.flush().await?;
         Ok(())

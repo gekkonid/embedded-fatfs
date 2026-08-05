@@ -30,6 +30,8 @@ log = ["dep:log"]
 defmt = ["dep:defmt"]
 # panic when dropping dirty files, files should be flushed before hand
 dirty-file-panic = []
+# FAT sector write-back cache (512 bytes RAM, collapses ~128 FAT RMW cycles per flush)
+fat-cache = []
 
 # Default features
 default = ["chrono", "lfn", "unicode", "log"]
