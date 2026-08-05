@@ -52,5 +52,7 @@ defmt = { version = "0.3", optional = true }
 [dev-dependencies]
 env_logger = "0.9"
 embedded-fatfs = { path = ".", features = [ "std", "alloc" ] }
-tokio = { version = "1", default-features = false, features = ["fs", "rt-multi-thread", "macros", "io-util"] }
+# "time" is for the repair tests, which put a timeout around operations that
+# must terminate on a corrupt volume rather than spin.
+tokio = { version = "1", default-features = false, features = ["fs", "rt-multi-thread", "macros", "io-util", "time"] }
 anyhow = "1"
