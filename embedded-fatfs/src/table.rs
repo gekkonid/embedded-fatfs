@@ -185,6 +185,39 @@ where
     Ok(FsStatusFlags { dirty, io_error })
 }
 
+/// Record a clean shutdown in FAT entry 1: the counterpart to
+/// [`read_fat_flags`], which nothing else in this crate writes.
+///
+/// The flag is stored inverted — the bit is *set* when the volume is clean — and
+/// lives alongside the hard-error bit, which is deliberately left as found: it
+/// says the device once returned an error, which is not something a filesystem
+/// check either verifies or refutes. FAT12 has no such flag and is a no-op.
+pub(crate) async fn set_fat_clean_flag<S, E>(fat: &mut S, fat_type: FatType) -> Result<(), Error<E>>
+where
+    S: Read + Write + Seek,
+    E: IoError,
+    Error<E>: From<S::Error> + From<ReadExactError<S::Error>>,
+{
+    let clean_bit = match fat_type {
+        FatType::Fat12 => return Ok(()),
+        FatType::Fat16 => 1 << 15,
+        FatType::Fat32 => 1 << 27,
+    };
+    let val = match fat_type {
+        FatType::Fat16 => Fat16::get_raw(fat, 1).await?,
+        FatType::Fat32 => Fat32::get_raw(fat, 1).await?,
+        FatType::Fat12 => unreachable!("returned above"),
+    };
+    if val & clean_bit != 0 {
+        return Ok(());
+    }
+    match fat_type {
+        FatType::Fat16 => Fat16::set_raw(fat, 1, val | clean_bit).await,
+        FatType::Fat32 => Fat32::set_raw(fat, 1, val | clean_bit).await,
+        FatType::Fat12 => unreachable!("returned above"),
+    }
+}
+
 pub(crate) async fn count_free_clusters<S, E>(
     fat: &mut S,
     fat_type: FatType,

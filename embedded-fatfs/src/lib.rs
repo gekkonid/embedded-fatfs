@@ -74,6 +74,7 @@ mod fatcache;
 mod file;
 mod fs;
 mod io;
+pub mod repair;
 mod table;
 mod time;
 
@@ -82,4 +83,5 @@ pub use crate::dir_entry::*;
 pub use crate::error::*;
 pub use crate::file::*;
 pub use crate::fs::*;
+pub use crate::repair::*;
 pub use crate::time::*;

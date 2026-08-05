@@ -18,7 +18,8 @@ use crate::error::Error;
 use crate::file::File;
 use crate::io::{self, IoBase, Read, ReadLeExt, Seek, SeekFrom, Write, WriteLeExt};
 use crate::table::{
-    alloc_cluster, count_free_clusters, format_fat, read_fat_flags, ClusterIterator, RESERVED_FAT_ENTRIES,
+    alloc_cluster, count_free_clusters, format_fat, read_fat_flags, set_fat_clean_flag, ClusterIterator,
+    RESERVED_FAT_ENTRIES,
 };
 use crate::time::{DefaultTimeProvider, TimeProvider};
 
@@ -344,7 +345,7 @@ pub struct FileSystem<IO: Read + Write + Seek, TP, OCC> {
     pub(crate) bpb: BiosParameterBlock,
     first_data_sector: u32,
     root_dir_sectors: u32,
-    total_clusters: u32,
+    pub(crate) total_clusters: u32,
     fs_info: RefCell<FsInfoSector>,
     current_status_flags: Cell<FsStatusFlags>,
     /// Track if we have recomputed the free-cluster count ourselves. If so, we *can* write it during flush, saving the
@@ -520,7 +521,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         self.bpb.clusters_from_bytes(bytes)
     }
 
-    fn fat_slice(&self) -> FatSlice<'_, IO, TP, OCC> {
+    pub(crate) fn fat_slice(&self) -> FatSlice<'_, IO, TP, OCC> {
         #[cfg(feature = "fat-cache")]
         if self.bpb.bytes_per_sector == 512 {
             return FatSlice::Cached(CachedFatSlice::new(
@@ -529,6 +530,26 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
             ));
         }
         FatSlice::Direct(fat_slice(FsIoAdapter { fs: self }, &self.bpb))
+    }
+
+    /// The FAT as it is on disk, with no cache in front of it.
+    ///
+    /// `repair` reads and writes the FAT copies individually — deciding a mirror disagreement means reading one copy
+    /// and writing another — which the cache cannot express: it holds a single sector and broadcasts every write to
+    /// every mirror at once. Mixing the two views leaves repair reasoning about a copy it is not actually addressing.
+    pub(crate) fn fat_slice_uncached(&self) -> FatSlice<'_, IO, TP, OCC> {
+        FatSlice::Direct(fat_slice(FsIoAdapter { fs: self }, &self.bpb))
+    }
+
+    /// Write back and then forget the buffered FAT sector.
+    ///
+    /// Needed before anything addresses the FAT directly: the cache would otherwise hold a sector from before that
+    /// work and write it back afterwards, undoing part of it.
+    #[cfg(feature = "fat-cache")]
+    pub(crate) async fn drop_fat_cache(&self) -> Result<(), Error<IO::Error>> {
+        self.flush_fat_cache().await?;
+        self.fat_cache.borrow_mut().window = None;
+        Ok(())
     }
 
     /// Writes the buffered FAT sector back to disk (to all mirrors) if dirty.
@@ -552,6 +573,65 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
     ) -> ClusterIterator<impl ReadWriteSeek<Error = Error<IO::Error>> + '_, IO::Error> {
         let disk_slice = self.fat_slice();
         ClusterIterator::new(disk_slice, self.fat_type, cluster)
+    }
+
+    /// Declare the volume clean, because it has been checked and found sound.
+    ///
+    /// FAT records an unclean shutdown in two independent places and
+    /// [`FileSystem::read_status_flags`] reports them as one: a flag in
+    /// the boot sector, and a bit in FAT entry 1 that other operating systems
+    /// write. Clearing only one leaves the volume looking dirty for ever, so a
+    /// device that repairs whenever it mounts dirty would repair on every boot
+    /// until the card wore out.
+    ///
+    /// This bypasses the caution in [`FileSystem::flush`], which refuses to
+    /// clear a flag it did not earn. A completed repair has earned it — that is
+    /// the whole point of the exercise.
+    pub(crate) async fn mark_clean(&self) -> Result<(), Error<IO::Error>> {
+        self.set_dirty_flag(false).await?;
+        set_fat_clean_flag(&mut self.fat_slice(), self.fat_type).await
+    }
+
+    /// The free-cluster count currently cached from the FS Information Sector,
+    /// or `None` when it holds no usable value.
+    ///
+    /// This is the stored hint, not a fact: comparing it against a real count is
+    /// how [`FileSystem::repair`](crate::FileSystem::repair) decides whether
+    /// `FSInfo` needs rewriting.
+    pub(crate) fn free_cluster_count_hint(&self) -> Option<u32> {
+        self.fs_info.borrow().free_cluster_count
+    }
+
+    /// Record a free-cluster count that was arrived at by counting, not by
+    /// bookkeeping.
+    ///
+    /// Marks the count verified, so `flush` is willing to clear the dirty flag
+    /// on a volume that was mounted dirty: a caller that has just swept the
+    /// whole FAT (see [`FileSystem::repair`](crate::FileSystem::repair)) has
+    /// done the very work the flag was asking for.
+    pub(crate) fn set_verified_free_cluster_count(&self, count: u32) {
+        self.fs_info.borrow_mut().set_free_cluster_count(count);
+        self.free_count_verified.set(true);
+    }
+
+    /// Record that this volume must stay marked dirty, whatever else happens.
+    ///
+    /// [`FileSystem::flush`] clears the dirty flag once the free-cluster count has been recomputed, on the grounds that
+    /// a full FAT scan is the check the flag was demanding. A repair that walked the volume and found it wanting knows
+    /// better, and has to be able to say so — otherwise the `unmount` that follows it silently overrides the judgement,
+    /// and a volume that was never fully checked comes back up looking clean.
+    pub(crate) fn withhold_clean_flag(&self) {
+        self.free_count_verified.set(false);
+    }
+
+    /// Point the allocation hint at a cluster known to be free.
+    ///
+    /// Allocation searches forward from this hint, so a wrong one costs a scan
+    /// and an absent one costs a scan of everything already in use. Anything
+    /// that has just walked the whole FAT — a repair, say — knows the right
+    /// answer and should say so.
+    pub(crate) fn set_next_free_cluster_hint(&self, cluster: u32) {
+        self.fs_info.borrow_mut().set_next_free_cluster(cluster);
     }
 
     pub(crate) async fn truncate_cluster_chain(&self, cluster: u32) -> Result<(), Error<IO::Error>> {
@@ -661,9 +741,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
     ///
     /// `Error::Io` will be returned if the underlying storage object returned an I/O error.
     pub async fn flush(&self) -> Result<(), Error<IO::Error>> {
-        #[cfg(feature = "fat-cache")]
-        self.flush_fat_cache().await?;
-        self.flush_fs_info().await?;
+        self.flush_state().await?;
         // A volume mounted dirty stays dirty, except if we have scanned the FAT ourselves. The scan fulfills the check
         // the flag demanded, and clearing it avoids every future mount repeating the scan.
         let mounted_dirty = self.bpb.status_flags().dirty;
@@ -671,6 +749,17 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
             self.set_dirty_flag(false).await?;
         }
         Ok(())
+    }
+
+    /// Writes cached state out, and decides nothing about the dirty flag.
+    ///
+    /// [`FileSystem::flush`] pairs this with a rule of its own about when the volume may be called clean. A caller that
+    /// has its own rule — a repair, which answers a harder question than "did we recompute the count" — needs the
+    /// persisting half without the deciding half, or the two rules fight over one bit.
+    pub(crate) async fn flush_state(&self) -> Result<(), Error<IO::Error>> {
+        #[cfg(feature = "fat-cache")]
+        self.flush_fat_cache().await?;
+        self.flush_fs_info().await
     }
 
     async fn flush_fs_info(&self) -> Result<(), Error<IO::Error>> {
@@ -843,7 +932,7 @@ impl<IO: ReadWriteSeek, TP, OCC> Clone for FsIoAdapter<'_, IO, TP, OCC> {
 /// When the `fat-cache` feature is enabled and the filesystem uses 512-byte
 /// sectors, accesses are routed through a single-sector write-back cache
 /// (`Cached`).  Otherwise a direct [`DiskSlice`] view is used (no extra RAM).
-enum FatSlice<'a, IO: ReadWriteSeek, TP, OCC> {
+pub(crate) enum FatSlice<'a, IO: ReadWriteSeek, TP, OCC> {
     #[cfg(feature = "fat-cache")]
     Cached(CachedFatSlice<'a, IO, TP, OCC>),
     Direct(DiskSlice<FsIoAdapter<'a, IO, TP, OCC>>),
