@@ -28,7 +28,7 @@ pub(crate) enum DirRawStream<'a, IO: ReadWriteSeek, TP, OCC> {
 }
 
 impl<IO: ReadWriteSeek, TP, OCC> DirRawStream<'_, IO, TP, OCC> {
-    fn abs_pos(&self) -> Option<u64> {
+    pub(crate) fn abs_pos(&self) -> Option<u64> {
         match self {
             DirRawStream::File(file) => file.abs_pos(),
             DirRawStream::Root(slice) => Some(slice.abs_pos()),
@@ -108,7 +108,7 @@ enum DirEntryOrShortName<'a, IO: ReadWriteSeek, TP, OCC> {
 /// This struct is created by the `open_dir` or `create_dir` methods on `Dir`.
 /// The root directory is returned by the `root_dir` method on `FileSystem`.
 pub struct Dir<'a, IO: ReadWriteSeek, TP, OCC> {
-    stream: DirRawStream<'a, IO, TP, OCC>,
+    pub(crate) stream: DirRawStream<'a, IO, TP, OCC>,
     fs: &'a FileSystem<IO, TP, OCC>,
 }
 

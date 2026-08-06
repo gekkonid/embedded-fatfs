@@ -472,7 +472,7 @@ pub(crate) struct DirEntryEditor {
 }
 
 impl DirEntryEditor {
-    fn new(data: DirFileEntryData, pos: u64) -> Self {
+    pub(crate) fn new(data: DirFileEntryData, pos: u64) -> Self {
         Self {
             data,
             pos,
