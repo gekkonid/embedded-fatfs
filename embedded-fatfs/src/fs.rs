@@ -22,6 +22,9 @@ use crate::table::{
 };
 use crate::time::{DefaultTimeProvider, TimeProvider};
 
+#[cfg(feature = "fat-cache")]
+use crate::fatcache::{CachedFatSlice, FatCache, FAT_CACHE_SIZE};
+
 // FAT implementation based on:
 //   http://wiki.osdev.org/FAT
 //   https://www.win.tue.nl/~aeb/linux/fs/fat/fat-1.html
@@ -347,6 +350,8 @@ pub struct FileSystem<IO: Read + Write + Seek, TP, OCC> {
     /// Track if we have recomputed the free-cluster count ourselves. If so, we *can* write it during flush, saving the
     /// next mount from doing this scan.
     free_count_verified: Cell<bool>,
+    #[cfg(feature = "fat-cache")]
+    pub(crate) fat_cache: RefCell<FatCache>,
 }
 
 /// The underlying storage device
@@ -439,6 +444,8 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
             fs_info: RefCell::new(fs_info),
             current_status_flags: Cell::new(status_flags),
             free_count_verified: Cell::new(false),
+            #[cfg(feature = "fat-cache")]
+            fat_cache: RefCell::new(FatCache::new()),
         })
     }
 
@@ -513,9 +520,30 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         self.bpb.clusters_from_bytes(bytes)
     }
 
-    fn fat_slice(&self) -> impl ReadWriteSeek<Error = Error<IO::Error>> + '_ {
-        let io = FsIoAdapter { fs: self };
-        fat_slice(io, &self.bpb)
+    fn fat_slice(&self) -> FatSlice<'_, IO, TP, OCC> {
+        #[cfg(feature = "fat-cache")]
+        if self.bpb.bytes_per_sector == 512 {
+            return FatSlice::Cached(CachedFatSlice::new(
+                self,
+                self.bpb.bytes_from_sectors(self.bpb.sectors_per_fat()),
+            ));
+        }
+        FatSlice::Direct(fat_slice(FsIoAdapter { fs: self }, &self.bpb))
+    }
+
+    /// Writes the buffered FAT sector back to disk (to all mirrors) if dirty.
+    #[cfg(feature = "fat-cache")]
+    pub(crate) async fn flush_fat_cache(&self) -> Result<(), Error<IO::Error>> {
+        let mut cache = self.fat_cache.borrow_mut();
+        if cache.dirty {
+            if let Some(window) = cache.window {
+                let mut raw = fat_slice(FsIoAdapter { fs: self }, &self.bpb);
+                raw.seek(SeekFrom::Start(window * FAT_CACHE_SIZE as u64)).await?;
+                raw.write_all(&cache.buf).await?;
+            }
+            cache.dirty = false;
+        }
+        Ok(())
     }
 
     pub(crate) fn cluster_iter(
@@ -633,6 +661,8 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
     ///
     /// `Error::Io` will be returned if the underlying storage object returned an I/O error.
     pub async fn flush(&self) -> Result<(), Error<IO::Error>> {
+        #[cfg(feature = "fat-cache")]
+        self.flush_fat_cache().await?;
         self.flush_fs_info().await?;
         // A volume mounted dirty stays dirty, except if we have scanned the FAT ourselves. The scan fulfills the check
         // the flag demanded, and clearing it avoids every future mount repeating the scan.
@@ -768,7 +798,7 @@ impl<IO: Read + Write + Seek, TP, OCC> Drop for FileSystem<IO, TP, OCC> {
 }
 
 pub(crate) struct FsIoAdapter<'a, IO: ReadWriteSeek, TP, OCC> {
-    fs: &'a FileSystem<IO, TP, OCC>,
+    pub(crate) fs: &'a FileSystem<IO, TP, OCC>,
 }
 
 impl<IO: ReadWriteSeek, TP, OCC> IoBase for FsIoAdapter<'_, IO, TP, OCC> {
@@ -808,10 +838,63 @@ impl<IO: ReadWriteSeek, TP, OCC> Clone for FsIoAdapter<'_, IO, TP, OCC> {
     }
 }
 
-fn fat_slice<S: ReadWriteSeek, B: BorrowMut<S>>(
+/// Unified return type for [`FileSystem::fat_slice`].
+///
+/// When the `fat-cache` feature is enabled and the filesystem uses 512-byte
+/// sectors, accesses are routed through a single-sector write-back cache
+/// (`Cached`).  Otherwise a direct [`DiskSlice`] view is used (no extra RAM).
+enum FatSlice<'a, IO: ReadWriteSeek, TP, OCC> {
+    #[cfg(feature = "fat-cache")]
+    Cached(CachedFatSlice<'a, IO, TP, OCC>),
+    Direct(DiskSlice<FsIoAdapter<'a, IO, TP, OCC>>),
+}
+
+impl<IO: ReadWriteSeek, TP, OCC> IoBase for FatSlice<'_, IO, TP, OCC> {
+    type Error = Error<IO::Error>;
+}
+
+impl<IO: ReadWriteSeek, TP, OCC> Read for FatSlice<'_, IO, TP, OCC> {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        match self {
+            #[cfg(feature = "fat-cache")]
+            Self::Cached(c) => c.read(buf).await,
+            Self::Direct(d) => d.read(buf).await,
+        }
+    }
+}
+
+impl<IO: ReadWriteSeek, TP, OCC> Write for FatSlice<'_, IO, TP, OCC> {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        match self {
+            #[cfg(feature = "fat-cache")]
+            Self::Cached(c) => c.write(buf).await,
+            Self::Direct(d) => d.write(buf).await,
+        }
+    }
+
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        match self {
+            #[cfg(feature = "fat-cache")]
+            Self::Cached(c) => c.flush().await,
+            Self::Direct(d) => d.flush().await,
+        }
+    }
+}
+
+impl<IO: ReadWriteSeek, TP, OCC> Seek for FatSlice<'_, IO, TP, OCC> {
+    async fn seek(&mut self, pos: SeekFrom) -> Result<u64, Self::Error> {
+        match self {
+            #[cfg(feature = "fat-cache")]
+            Self::Cached(c) => c.seek(pos).await,
+            Self::Direct(d) => d.seek(pos).await,
+        }
+    }
+}
+
+pub(crate) fn fat_slice<S: ReadWriteSeek, B: BorrowMut<S>>(
     io: B,
     bpb: &BiosParameterBlock,
-) -> impl ReadWriteSeek<Error = Error<S::Error>> {
+) -> DiskSlice<B, S> {
     let sectors_per_fat = bpb.sectors_per_fat();
     let mirroring_enabled = bpb.mirroring_enabled();
     let (fat_first_sector, mirrors) = if mirroring_enabled {
