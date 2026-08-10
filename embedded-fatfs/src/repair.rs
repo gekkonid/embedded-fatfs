@@ -8,8 +8,8 @@
 //! failure modes. We clear the filesystem dirty bit in limited circumstances: never for a [`RepairMode::DryRun`], not
 //! when the scratch buffer ran out of depth and part of the tree went unvisited, and not for any  subset of flags
 //! narrower than [`RepairMode::Minimal`], which could leave behind damage of a class it was never asked to repair. The
-//! hard-error bit is never touched. It says the device returned an error once, which a filesystem check neither
-//! verifies nor refutes.
+//! hard-error bit is left as found, except when FAT entry 1 itself is corrupted beyond recovery, in which case we set
+//! it.
 //!
 //! The caller supplies all working memory, as a mutable byte slice. The required size is given by
 //! [`scratch_size_for_depth`]. This buffer holds one small frame per level of directory nesting, and nothing else grows
@@ -120,7 +120,7 @@ bitflags! {
 }
 
 impl Default for RepairMode {
-    /// Minimal is the recommended mode to catch most erors without excessive FAT scans or writing cluster marks.
+    /// Minimal is the recommended mode to catch most errors without excessive FAT scans or writing cluster marks.
     fn default() -> Self {
         Self::Minimal
     }
@@ -843,9 +843,14 @@ async fn scan_dir<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter>(
         let raw = match DirEntryData::deserialize(&mut stream).await {
             Ok(raw) => raw,
             // Running off the end of the directory's data means its chain was cut short. A directory that stops without
-            // an end marker simply stops.
+            // an end marker simply stops, but first clean up any long-name entries that were part of a run whose short
+            // name never arrived.
             Err(Error::UnexpectedEof) => {
                 warn!("FAT repair: directory ends without an end-of-directory marker");
+                if let Some(start) = lfn_start {
+                    debug!("FAT repair: dropping long-name entries with no file behind them");
+                    delete_range(fs, &mut stream, start, pos, mode, RepairMode::LongNames, stats).await?;
+                }
                 return Ok(DirStep::Done);
             }
             Err(e) => return Err(e),
